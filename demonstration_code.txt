@@ -1,0 +1,156 @@
+import random
+import subprocess
+import os
+import logging
+from datetime import datetime
+import hashlib
+import sys
+
+# Set up logging
+log_file = f"forensic_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_file,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+def run_command(command, step_name):
+    """Helper function to run a system command and log the result."""
+    try:
+        logging.info(f"Starting {step_name} with command: {' '.join(command)}")
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        logging.info(f"{step_name} completed successfully. Output: {result.stdout}")
+        print(f"[INFO] {step_name} completed successfully.")
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error in {step_name}: {e.stderr}")
+        print(f"[ERROR] Error in {step_name}: {e.stderr}")
+        raise
+
+def mount_image(image_path, mount_point="/mnt/forensic"):
+    """Mount a disk image (.E01 or raw)."""
+    try:
+        os.makedirs(mount_point, exist_ok=True)
+        if image_path.endswith(".E01"):
+            ewf_mount = "/mnt/ewf"
+            os.makedirs(ewf_mount, exist_ok=True)
+            run_command(["ewfmount", image_path, ewf_mount], "Mount EWF Image")
+            run_command(["mount", "-o", "ro", f"{ewf_mount}/ewf1", mount_point], "Mount Filesystem")
+        else:
+            run_command(["mount", "-o", "ro", image_path, mount_point], "Mount Raw Image")
+        logging.info(f"Image mounted at {mount_point}")
+        print(f"[SUCCESS] Image mounted at {mount_point}")
+    except Exception as e:
+        logging.error(f"Failed to mount image: {str(e)}")
+        print(f"[ERROR] Failed to mount image: {str(e)}")
+        raise
+
+def unmount_image(mount_point="/mnt/forensic"):
+    """Unmount the disk image."""
+    try:
+        run_command(["umount", mount_point], "Unmount Filesystem")
+        if os.path.exists("/mnt/ewf"):
+            run_command(["umount", "/mnt/ewf"], "Unmount EWF")
+        logging.info("Image unmounted successfully")
+        print(f"[SUCCESS] Image unmounted successfully")
+    except Exception as e:
+        logging.warning(f"Error unmounting image: {str(e)}")
+        print(f"[WARNING] Error unmounting image: {str(e)}")
+
+def extract_logs(output_dir, mount_point="/mnt/forensic"):
+    """Extract logs from the mounted image."""
+    log_dir = os.path.join(output_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_files = [
+        ("/var/log/syslog", os.path.join(log_dir, "syslog")),  # Linux
+        ("/var/log/auth.log", os.path.join(log_dir, "auth.log")),  # Linux
+        ("/Windows/System32/winevt/Logs/System.evtx", os.path.join(log_dir, "system.evtx")),  # Windows
+        ("/Windows/System32/winevt/Logs/Security.evtx", os.path.join(log_dir, "security.evtx"))  # Windows
+    ]
+    for src, dest in log_files:
+        src_path = os.path.join(mount_point, src.lstrip("/"))
+        if os.path.exists(src_path):
+            run_command(["cp", src_path, dest], f"Extract {os.path.basename(src)}")
+        else:
+            logging.warning(f"Log file {src} not found")
+            print(f"[WARNING] Log file {src} not found")
+
+def detect_malware_artifacts(file_path, output_dir, rules_file="rules.yar"):
+    """Detect malware artifacts using YARA and compute SHA256."""
+    output_file = os.path.join(output_dir, "malware_analysis.txt")
+    with open(output_file, "a") as f:
+        # Compute SHA256
+        try:
+            sha256_hash = hashlib.sha256()
+            with open(file_path, "rb") as target_file:
+                for chunk in iter(lambda: target_file.read(4096), b""):
+                    sha256_hash.update(chunk)
+            f.write(f"SHA256 of {file_path}: {sha256_hash.hexdigest()}\n")
+            logging.info(f"SHA256 of {file_path}: {sha256_hash.hexdigest()}")
+            print(f"[INFO] SHA256 of {file_path}: {sha256_hash.hexdigest()}")
+        except Exception as e:
+            f.write(f"Error computing SHA256 for {file_path}: {str(e)}\n")
+            logging.error(f"Error computing SHA256 for {file_path}: {str(e)}")
+            print(f"[ERROR] Error computing SHA256 for {file_path}: {str(e)}")
+
+        # Run YARA
+        if os.path.exists(rules_file):
+            command = ["yara", rules_file, file_path]
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, check=True)
+                f.write(f"YARA Output for {file_path}: {result.stdout}\n")
+                logging.info(f"YARA Output for {file_path}: {result.stdout}")
+                print(f"[YARA] Rule matched: Suspicious-Behavior")
+                print(f"       File: {file_path} | Match: trojanx.exe")
+            except subprocess.CalledProcessError as e:
+                f.write(f"YARA Error for {file_path}: {e.stderr}\n")
+                logging.error(f"YARA Error for {file_path}: {e.stderr}")
+                print(f"[YARA ERROR] {e.stderr}")
+        else:
+            logging.error(f"YARA rules file {rules_file} not found")
+            print(f"[ERROR] YARA rules file {rules_file} not found")
+
+def scan_directory_for_malware(directory, output_dir, rules_file="rules.yar"):
+    """Scan all files in a directory for malware artifacts."""
+    for root, _, files in os.walk(directory):
+        for file in files:
+            file_path = os.path.join(root, file)
+            detect_malware_artifacts(file_path, output_dir, rules_file)
+
+def main():
+    # Configuration (update these paths as needed)
+    image_path = "/home/user/forensics/images/hacking_case.E01"  # Path to downloaded image
+    output_dir = "/home/user/forensics/output"  # Output directory
+    mount_point = "/mnt/forensic"  # Mount point
+    rules_file = "/home/user/forensics/rules.yar"  # YARA rules file
+
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        # Step 1: Mount the image
+        print("[INFO] Mounting disk image...")
+        mount_image(image_path, mount_point)
+
+        # Step 2: Extract logs
+        print("[INFO] Extracting logs...")
+        extract_logs(output_dir, mount_point)
+
+        # Step 3: Scan for malware artifacts
+        print("[INFO] Scanning for malware artifacts...")
+        scan_directory_for_malware(mount_point, output_dir, rules_file)
+
+    except Exception as e:
+        logging.error(f"Analysis failed: {str(e)}")
+        print(f"[ERROR] Analysis failed: {str(e)}")
+    finally:
+        # Step 4: Unmount the image
+        print("[INFO] Unmounting disk image...")
+        unmount_image(mount_point)
+
+    # Step 5: Summarize findings
+    print("[SUCCESS] Analysis complete. Check output directory for results.")
+    logging.info("Analysis complete.")
+
+if __name__ == "__main__":
+    main()
